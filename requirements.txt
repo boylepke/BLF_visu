@@ -1,0 +1,7 @@
+# Core — tkinter is part of the Python standard library, no pip entry needed.
+
+# Optional — uncomment to enable the Signal Plot tab:
+# matplotlib>=3.7
+
+# Optional — uncomment to enable the GPS Track Map tab:
+# tkintermapview>=0.3
