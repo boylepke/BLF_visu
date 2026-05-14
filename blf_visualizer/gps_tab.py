@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox
 
 from blf_visualizer.theme import (
     DARK_BG, PANEL_BG, TEXT_FG, MUTED,
-    ACCENT, ACCENT2, ACCENT3, SEL_BG,
+    ACCENT, ACCENT2, ACCENT3, SEL_BG, CURSOR_COLOR,
 )
 
 
@@ -101,6 +101,23 @@ class GpsTabMixin:
                            selectcolor=DARK_BG,
                            activebackground=PANEL_BG, activeforeground=TEXT_FG,
                            font=("Consolas", 9)).pack(anchor="w")
+
+        # Graph signal selector
+        graph_f = tk.LabelFrame(left, text=" Graph Signal ",
+                                bg=PANEL_BG, fg=ACCENT2,
+                                font=("Consolas", 8, "bold"),
+                                bd=1, relief="solid", padx=6, pady=6)
+        graph_f.pack(fill="x", padx=8, pady=(0, 4))
+        tk.Label(graph_f, text="Signal:", bg=PANEL_BG, fg=MUTED,
+                 font=("Consolas", 8), anchor="w").pack(fill="x")
+        self._gps_graph_sig_var = tk.StringVar()
+        self._gps_graph_combo = ttk.Combobox(graph_f,
+                                              textvariable=self._gps_graph_sig_var,
+                                              state="readonly", width=26)
+        self._gps_graph_combo["values"] = []
+        self._gps_graph_combo.pack(fill="x", pady=(2, 0))
+        self._gps_graph_combo.bind("<<ComboboxSelected>>",
+                                   lambda e: self._gps_rebuild_graph_if_loaded())
 
         # Overlay signals list
         ov_f = tk.LabelFrame(left, text=" Hover Overlay Signals ",
@@ -193,6 +210,10 @@ class GpsTabMixin:
             relief="flat", bd=0, padx=8, pady=5,
             highlightbackground=MUTED, highlightthickness=1)
 
+        # Graph holder — packed below map when a graph signal is active
+        self._gps_graph_holder = tk.Frame(right, bg=DARK_BG)
+        # (not packed here — shown/hidden by _gps_build_graph)
+
         # Internal state
         self._gps_track:          list  = []
         self._gps_map_widget            = None
@@ -201,6 +222,11 @@ class GpsTabMixin:
         self._gps_play_after_id         = None
         self._gps_play_speed:     float = 1.0
         self._gps_car_marker            = None
+
+        # Graph state
+        self._gps_graph_canvas          = None   # FigureCanvasTkAgg
+        self._gps_graph_ax              = None   # matplotlib Axes
+        self._gps_graph_vline           = None   # axvline cursor artist
 
     # ── Overlay list ──────────────────────────────────────────────────────
 
@@ -243,6 +269,7 @@ class GpsTabMixin:
             for cb in self._gps_signal_combos:
                 cb["values"] = sigs
             self._gps_ov_pick["values"] = ov_slot.cache.available or sigs
+            self._gps_graph_combo["values"] = ov_slot.cache.available or sigs
             messagebox.showinfo("GPS",
                 "Select Latitude and Longitude signals, then click Load Track.")
             return
@@ -355,6 +382,13 @@ class GpsTabMixin:
         self._gps_play_idx = 0
         self._gps_play_bar.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
 
+        # Populate graph combo (uses overlay slot) and render graph
+        ov_slot = (self.slot_a if self._gps_ov_slot_var.get() == "A"
+                   else self.slot_b)
+        sigs = ov_slot.cache.available
+        self._gps_graph_combo["values"] = sigs
+        self._gps_build_graph()
+
     # ── Playback ──────────────────────────────────────────────────────────
 
     def _gps_play(self):
@@ -381,6 +415,7 @@ class GpsTabMixin:
             self._gps_seeker_var.set(ts)
             self._gps_time_lbl.config(text=f"{ts:.3f} s")
             self._gps_move_car(0)
+            self._gps_update_graph_cursor(ts)
         self._gps_tooltip.place_forget()
 
     def _gps_speed_changed(self, event=None):
@@ -396,6 +431,7 @@ class GpsTabMixin:
                          len(self._gps_track) - 1))
         self._gps_play_idx = idx
         self._gps_move_car(idx)
+        self._gps_update_graph_cursor(t)
 
     def _gps_tick(self):
         if not self._gps_playing:
@@ -421,6 +457,7 @@ class GpsTabMixin:
             return
         ts, lat, lon = self._gps_track[idx]
         self._gps_car_marker.set_position(lat, lon)
+        self._gps_update_graph_cursor(ts)
 
         if not self._gps_overlay_signals:
             self._gps_tooltip.place_forget()
@@ -455,6 +492,102 @@ class GpsTabMixin:
         ty = max(4, min(ty, self.winfo_height() - th - 4))
         self._gps_tooltip.place(x=tx, y=ty)
         self._gps_tooltip.lift()
+
+    # ── Signal graph ──────────────────────────────────────────────────────
+
+    def _gps_rebuild_graph_if_loaded(self):
+        """Called when the graph-signal combo changes while a track is loaded."""
+        if self._gps_track:
+            self._gps_build_graph()
+
+    def _gps_build_graph(self):
+        """
+        Render (or re-render) the signal graph below the map.
+        Hides the graph holder when no signal is selected or matplotlib
+        is unavailable.
+        """
+        try:
+            import matplotlib
+            matplotlib.use("TkAgg")
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.ticker import FuncFormatter
+        except ImportError:
+            self._gps_graph_holder.pack_forget()
+            return
+
+        sig_name = self._gps_graph_sig_var.get().strip()
+        if not sig_name or not self._gps_track:
+            self._gps_graph_holder.pack_forget()
+            self._gps_graph_canvas = None
+            self._gps_graph_ax     = None
+            self._gps_graph_vline  = None
+            return
+
+        ov_slot = (self.slot_a if self._gps_ov_slot_var.get() == "A"
+                   else self.slot_b)
+        series = ov_slot.cache.series.get(sig_name)
+        if series is None:
+            self._gps_graph_holder.pack_forget()
+            return
+
+        sig_ts, sig_vals = series
+        label   = ov_slot.cache.labels.get(sig_name, sig_name)
+        t_start = self._gps_track[0][0]
+
+        # Tear down any previous graph widgets
+        for w in self._gps_graph_holder.winfo_children():
+            w.destroy()
+        self._gps_graph_canvas = None
+        self._gps_graph_ax     = None
+        self._gps_graph_vline  = None
+
+        # Build the figure
+        fig = Figure(figsize=(10, 2.2), dpi=96, facecolor=DARK_BG)
+        fig.subplots_adjust(left=0.06, right=0.99, top=0.88, bottom=0.24)
+        ax  = fig.add_subplot(111)
+
+        ax.set_facecolor(PANEL_BG)
+        ax.tick_params(colors=MUTED, labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(MUTED)
+        ax.grid(True, color=MUTED, alpha=0.2, linestyle="--")
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.1f}"))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.3g}"))
+        ax.set_xlabel("Elapsed Time (s)", color=MUTED, fontsize=7, labelpad=2)
+        ax.set_ylabel(label, color=TEXT_FG, fontsize=7, labelpad=4)
+        ax.set_title(label, color=ACCENT2, fontsize=8, loc="left", pad=3,
+                     fontfamily="monospace")
+
+        ax.step(sig_ts, sig_vals, where="post",
+                color=ACCENT2, linewidth=1.3, zorder=3)
+
+        # Vertical time cursor
+        vline = ax.axvline(x=t_start, color=CURSOR_COLOR,
+                           linewidth=1.4, linestyle="--",
+                           alpha=0.9, zorder=10)
+
+        canvas = FigureCanvasTkAgg(fig, master=self._gps_graph_holder)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        self._gps_graph_canvas = canvas
+        self._gps_graph_ax     = ax
+        self._gps_graph_vline  = vline
+
+        # Show graph holder between the map and the play bar
+        self._gps_graph_holder.pack(side="bottom", fill="x",
+                                    padx=6, pady=(0, 2))
+
+    def _gps_update_graph_cursor(self, t: float):
+        """Move the vertical cursor line to timestamp *t*."""
+        if self._gps_graph_vline is None or self._gps_graph_canvas is None:
+            return
+        self._gps_graph_vline.set_xdata([t, t])
+        try:
+            self._gps_graph_canvas.draw_idle()
+        except Exception:
+            pass
 
     def _gps_latlon_to_canvas(self, lat: float, lon: float):
         mw = self._gps_map_widget
