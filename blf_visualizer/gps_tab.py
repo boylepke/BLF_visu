@@ -7,6 +7,7 @@ Requires tkintermapview at runtime (graceful warning if missing).
 
 import bisect
 import math
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -223,6 +224,15 @@ class GpsTabMixin:
         self._gps_play_speed:     float = 1.0
         self._gps_car_marker            = None
 
+        # Wall-clock anchors for accurate real-time playback
+        # At the moment play starts (or speed/seek changes), we record:
+        #   _gps_play_wall_start  — perf_counter() value
+        #   _gps_play_ts_start    — recording timestamp at that position
+        # Each tick derives: current_rec_ts = _gps_play_ts_start
+        #                                   + elapsed_wall * speed
+        self._gps_play_wall_start: float = 0.0
+        self._gps_play_ts_start:   float = 0.0
+
         # Graph state
         self._gps_graph_canvas          = None   # FigureCanvasTkAgg
         self._gps_graph_ax              = None   # matplotlib Axes
@@ -394,8 +404,16 @@ class GpsTabMixin:
     def _gps_play(self):
         if not self._gps_track or self._gps_map_widget is None:
             return
+
+        # If we've reached the end, restart from the beginning
         if self._gps_play_idx >= len(self._gps_track) - 1:
             self._gps_play_idx = 0
+
+        # Anchor wall clock to the current recording timestamp so the
+        # tick loop can derive position purely from elapsed real time
+        self._gps_play_ts_start   = self._gps_track[self._gps_play_idx][0]
+        self._gps_play_wall_start = time.perf_counter()
+
         self._gps_playing = True
         self._gps_play_btn.config(text="⏸", command=self._gps_pause)
         self._gps_tick()
@@ -419,36 +437,82 @@ class GpsTabMixin:
         self._gps_tooltip.place_forget()
 
     def _gps_speed_changed(self, event=None):
+        """Update speed multiplier.  If playing, rebase the clock anchor so
+        the car position doesn't jump when the user changes speed."""
         raw = self._gps_speed_var.get().replace("×", "")
-        try:   self._gps_play_speed = float(raw)
-        except ValueError: self._gps_play_speed = 1.0
+        try:
+            new_speed = float(raw)
+        except ValueError:
+            new_speed = 1.0
+
+        if self._gps_playing and self._gps_track:
+            # Compute the recording timestamp we are at right now
+            elapsed_wall  = time.perf_counter() - self._gps_play_wall_start
+            current_rec_ts = self._gps_play_ts_start + elapsed_wall * self._gps_play_speed
+            current_rec_ts = min(current_rec_ts, self._gps_track[-1][0])
+            # Rebase so the next tick continues from the same position
+            self._gps_play_ts_start   = current_rec_ts
+            self._gps_play_wall_start = time.perf_counter()
+
+        self._gps_play_speed = new_speed
 
     def _gps_on_seek(self, val):
+        """Scrubber drag — jump to a specific recording time."""
         t = float(val)
         self._gps_time_lbl.config(text=f"{t:.3f} s")
+
         ts_list = [p[0] for p in self._gps_track]
-        idx = max(0, min(bisect.bisect_left(ts_list, t),
-                         len(self._gps_track) - 1))
+        idx = max(0, min(bisect.bisect_left(ts_list, t), len(self._gps_track) - 1))
         self._gps_play_idx = idx
         self._gps_move_car(idx)
         self._gps_update_graph_cursor(t)
 
+        # If currently playing, rebase the clock to the new position so
+        # playback continues from here at the correct speed
+        if self._gps_playing:
+            self._gps_play_ts_start   = t
+            self._gps_play_wall_start = time.perf_counter()
+
     def _gps_tick(self):
+        """
+        Fixed-rate (~20 fps) playback loop driven by wall-clock time.
+
+        Rather than advancing one data point per call, we compute the correct
+        recording timestamp from elapsed real time and seek to it.  This makes
+        1× speed genuinely real-time and speed changes take effect immediately.
+        """
         if not self._gps_playing:
             return
-        idx   = self._gps_play_idx
-        track = self._gps_track
-        if idx >= len(track) - 1:
+
+        track  = self._gps_track
+        t_end  = track[-1][0]
+
+        # How far through the recording are we?
+        elapsed_wall   = time.perf_counter() - self._gps_play_wall_start
+        current_rec_ts = self._gps_play_ts_start + elapsed_wall * self._gps_play_speed
+
+        if current_rec_ts >= t_end:
+            # Reached the end — land exactly on the last point and stop
+            self._gps_play_idx = len(track) - 1
+            self._gps_move_car(self._gps_play_idx)
+            self._gps_seeker_var.set(t_end)
+            self._gps_time_lbl.config(text=f"{t_end:.3f} s")
             self._gps_pause()
             return
+
+        # Find the track index closest to current_rec_ts
+        ts_list = [p[0] for p in track]
+        idx = max(0, min(bisect.bisect_left(ts_list, current_rec_ts),
+                         len(track) - 1))
+        self._gps_play_idx = idx
+
+        # Update all UI elements
         self._gps_move_car(idx)
-        ts = track[idx][0]
-        self._gps_seeker_var.set(ts)
-        self._gps_time_lbl.config(text=f"{ts:.3f} s")
-        self._gps_play_idx += 1
-        dt    = track[idx + 1][0] - track[idx][0]
-        delay = max(16, int(dt * 1000 / self._gps_play_speed))
-        self._gps_play_after_id = self.after(delay, self._gps_tick)
+        self._gps_seeker_var.set(current_rec_ts)
+        self._gps_time_lbl.config(text=f"{current_rec_ts:.3f} s")
+
+        # Schedule next frame — fixed 50 ms (20 fps) regardless of data rate
+        self._gps_play_after_id = self.after(50, self._gps_tick)
 
     # ── Marker / tooltip ──────────────────────────────────────────────────
 
